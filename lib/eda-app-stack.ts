@@ -16,11 +16,13 @@ import { Construct } from "constructs";
 export class EDAAppStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
+    
 
     const imagesBucket = new s3.Bucket(this, "images", {
       removalPolicy: cdk.RemovalPolicy.DESTROY,
       autoDeleteObjects: true,
       publicReadAccess: false,
+      
     });
 
       // Integration infrastructure
@@ -37,6 +39,7 @@ export class EDAAppStack extends cdk.Stack {
       partitionKey: { name: "name", type: dynamodb.AttributeType.STRING },
       removalPolicy: cdk.RemovalPolicy.DESTROY,
       tableName: "Imagess",
+      
  });
 
   // Lambda functions
@@ -62,6 +65,10 @@ export class EDAAppStack extends cdk.Stack {
       receiveMessageWaitTime: cdk.Duration.seconds(10),
     });
 
+      const dlq = new sqs.Queue(this, "img-dlq", {
+      receiveMessageWaitTime: cdk.Duration.seconds(10),
+ });
+
 
        const mailerFn = new lambdanode.NodejsFunction(this, "mailer", {
       runtime: lambda.Runtime.NODEJS_16_X,
@@ -79,6 +86,13 @@ export class EDAAppStack extends cdk.Stack {
       new subs.SqsSubscription(imageProcessQueue)
     );
 
+const queue = new sqs.Queue(this, "img-created-queue", {
+      receiveMessageWaitTime: cdk.Duration.seconds(10),
+      deadLetterQueue: {
+        queue: dlq,
+        maxReceiveCount: 1
+ }
+ });
 
    // SQS --> Lambda
     const newImageEventSource = new events.SqsEventSource(imageProcessQueue, {
@@ -106,6 +120,23 @@ mailerFn.addEventSource(newImageMailEventSource);
       })
     );
 
+    const rejectedImageFn = new lambdanode.NodejsFunction(
+  this,
+  "RejectedImagesFn",
+  {
+    runtime: lambda.Runtime.NODEJS_20_X,
+    entry: `${__dirname}/../lambdas/rejectedImages.ts`,
+    timeout: cdk.Duration.seconds(15),
+    memorySize: 128,
+  }
+);
+
+const rejectedImageEventSource = new events.SqsEventSource(dlq, {
+  batchSize: 5,
+  maxBatchingWindow: cdk.Duration.seconds(10),
+});
+
+
     processImageFn.addEventSource(newImageEventSource);
 
     // Permissions
@@ -116,6 +147,7 @@ mailerFn.addEventSource(newImageMailEventSource);
         imagesTable.grantReadWriteData(processImageFn);
 
     newImageTopic.addSubscription(new subs.SqsSubscription(mailerQ));
+              rejectedImageFn.addEventSource(rejectedImageEventSource);
 
 
     // Output
