@@ -11,43 +11,49 @@ import * as iam from "aws-cdk-lib/aws-iam";
 import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 
 import { Construct } from "constructs";
-// import * as sqs from 'aws-cdk-lib/aws-sqs';
 
 export class EDAAppStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
-    
 
     const imagesBucket = new s3.Bucket(this, "images", {
       removalPolicy: cdk.RemovalPolicy.DESTROY,
       autoDeleteObjects: true,
       publicReadAccess: false,
-      
     });
 
-      // Integration infrastructure
-
-      const imageProcessQueue = new sqs.Queue(this, "img-process-q", {
+    const imageProcessQueue = new sqs.Queue(this, "img-process-q", {
       receiveMessageWaitTime: cdk.Duration.seconds(10),
     });
+
+    const dlq = new sqs.Queue(this, "img-dlq", {
+      receiveMessageWaitTime: cdk.Duration.seconds(10),
+    });
+
+    const queue = new sqs.Queue(this, "img-created-queue", {
+      receiveMessageWaitTime: cdk.Duration.seconds(10),
+      deadLetterQueue: {
+        queue: dlq,
+        maxReceiveCount: 1,
+      },
+    });
+
     const newImageTopic = new sns.Topic(this, "NewImageTopic", {
       displayName: "New Image topic",
-    }); 
+    });
 
     const imagesTable = new dynamodb.Table(this, "ImagesTable", {
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
       partitionKey: { name: "name", type: dynamodb.AttributeType.STRING },
       removalPolicy: cdk.RemovalPolicy.DESTROY,
       tableName: "Imagess",
-      
- });
+      stream: dynamodb.StreamViewType.NEW_IMAGE,
+    });
 
-  // Lambda functions
-
-       const processImageFn = new lambdanode.NodejsFunction(
+    const processImageFn = new lambdanode.NodejsFunction(
       this,
       "ProcessImageFn",
- {
+      {
         runtime: lambda.Runtime.NODEJS_18_X,
         entry: `${__dirname}/../lambdas/processImage.ts`,
         timeout: cdk.Duration.seconds(15),
@@ -55,49 +61,15 @@ export class EDAAppStack extends cdk.Stack {
         environment: {
           TABLE_NAME: imagesTable.tableName,
           BUCKET_NAME: imagesBucket.bucketName,
-          REGION: 'eu-west-1'
- },
- }
- );
-
-
-        const mailerQ = new sqs.Queue(this, "mailer-q", {
-      receiveMessageWaitTime: cdk.Duration.seconds(10),
-    });
-
-      const dlq = new sqs.Queue(this, "img-dlq", {
-      receiveMessageWaitTime: cdk.Duration.seconds(10),
- });
-
-
-       const mailerFn = new lambdanode.NodejsFunction(this, "mailer", {
-      runtime: lambda.Runtime.NODEJS_16_X,
-      memorySize: 1024,
-      timeout: cdk.Duration.seconds(3),
-      entry: `${__dirname}/../lambdas/mailer.ts`,
-    });
-
-    // S3 --> SQS
-        imagesBucket.addEventNotification(
-        s3.EventType.OBJECT_CREATED,
-        new s3n.SnsDestination(newImageTopic)  // Changed
-    );
-    newImageTopic.addSubscription(
-      new subs.SqsSubscription(imageProcessQueue)
+          REGION: "eu-west-1",
+        },
+      }
     );
 
-const queue = new sqs.Queue(this, "img-created-queue", {
-      receiveMessageWaitTime: cdk.Duration.seconds(10),
-      deadLetterQueue: {
-        queue: dlq,
-        maxReceiveCount: 1
- }
- });
-
-     const addMetadataFn = new lambdanode.NodejsFunction(
+    const addMetadataFn = new lambdanode.NodejsFunction(
       this,
       "addMetadataFn",
- {
+      {
         runtime: lambda.Runtime.NODEJS_20_X,
         entry: `${__dirname}/../lambdas/addImageMetadata.ts`,
         timeout: cdk.Duration.seconds(15),
@@ -105,46 +77,62 @@ const queue = new sqs.Queue(this, "img-created-queue", {
         environment: {
           TABLE_NAME: imagesTable.tableName,
         },
-    }
- );
+      }
+    );
 
-
-   // SQS --> Lambda
-    const newImageEventSource = new events.SqsEventSource(imageProcessQueue, {
-      batchSize: 5,
-      maxBatchingWindow: cdk.Duration.seconds(5),
+    const mailerFn = new lambdanode.NodejsFunction(this, "mailer", {
+      runtime: lambda.Runtime.NODEJS_16_X,
+      memorySize: 1024,
+      timeout: cdk.Duration.seconds(3),
+      entry: `${__dirname}/../lambdas/mailer.ts`,
     });
 
-        newImageTopic.addSubscription(
+    const rejectedImageFn = new lambdanode.NodejsFunction(
+      this,
+      "RejectedImagesFn",
+      {
+        runtime: lambda.Runtime.NODEJS_20_X,
+        entry: `${__dirname}/../lambdas/rejectedImages.ts`,
+        timeout: cdk.Duration.seconds(15),
+        memorySize: 128,
+      }
+    );
+
+    const newImageEventSource = new events.SqsEventSource(
+      imageProcessQueue,
+      {
+        batchSize: 5,
+        maxBatchingWindow: cdk.Duration.seconds(5),
+      }
+    );
+
+    const rejectedImageEventSource = new events.SqsEventSource(dlq, {
+      batchSize: 5,
+      maxBatchingWindow: cdk.Duration.seconds(10),
+    });
+
+    processImageFn.addEventSource(newImageEventSource);
+    rejectedImageFn.addEventSource(rejectedImageEventSource);
+
+    imagesBucket.addEventNotification(
+      s3.EventType.OBJECT_CREATED,
+      new s3n.SnsDestination(newImageTopic)
+    );
+
+  
+
+    newImageTopic.addSubscription(
       new subs.LambdaSubscription(addMetadataFn, {
         filterPolicy: {
           metadata_type: sns.SubscriptionFilter.stringFilter({
             allowlist: ["Caption", "Date", "Photographer"],
-      }),
-      },
-    })
- );
+          }),
+        },
+      })
+    );
+
     newImageTopic.addSubscription(
       new subs.SqsSubscription(imageProcessQueue, {
-        filterPolicyWithMessageBody: {
-          Records: sns.FilterOrPolicy.policy({
-            s3: sns.FilterOrPolicy.policy({
-              object: sns.FilterOrPolicy.policy({
-                key: sns.FilterOrPolicy.filter(
-                  sns.SubscriptionFilter.stringFilter({
-                    matchPrefixes: ["image"],
-                 })
-
-             ),
-           }),
-         }),
-         }),
-         },
-        rawMessageDelivery: true,
-      })
- );
-    newImageTopic.addSubscription(
-      new subs.SqsSubscription(mailerQ, {
         filterPolicyWithMessageBody: {
           Records: sns.FilterOrPolicy.policy({
             s3: sns.FilterOrPolicy.policy({
@@ -156,68 +144,27 @@ const queue = new sqs.Queue(this, "img-created-queue", {
                 ),
               }),
             }),
-           }),
-         },
+          }),
+        },
         rawMessageDelivery: true,
       })
- );
+    );
 
-     new cdk.CfnOutput(this, "SNS Topic ARN", {
-      value: newImageTopic.topicArn ,
-     });
+    imagesBucket.grantRead(processImageFn);
+    imagesTable.grantReadWriteData(processImageFn);
 
-
-        const newImageMailEventSource = new events.SqsEventSource(mailerQ, {
-      batchSize: 5,
-      maxBatchingWindow: cdk.Duration.seconds(5),
-    }); 
-mailerFn.addEventSource(newImageMailEventSource);
-
-
-  mailerFn.addToRolePolicy(
+    mailerFn.addToRolePolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
-        actions: [
-          "ses:SendEmail",
-          "ses:SendRawEmail",
-          "ses:SendTemplatedEmail",
-        ],
+        actions: ["ses:SendEmail", "ses:SendRawEmail", "ses:SendTemplatedEmail"],
         resources: ["*"],
       })
     );
 
-    const rejectedImageFn = new lambdanode.NodejsFunction(
-  this,
-  "RejectedImagesFn",
-  {
-    runtime: lambda.Runtime.NODEJS_20_X,
-    entry: `${__dirname}/../lambdas/rejectedImages.ts`,
-    timeout: cdk.Duration.seconds(15),
-    memorySize: 128,
-  }
-);
+    new cdk.CfnOutput(this, "SNS Topic ARN", {
+      value: newImageTopic.topicArn,
+    });
 
-const rejectedImageEventSource = new events.SqsEventSource(dlq, {
-  batchSize: 5,
-  maxBatchingWindow: cdk.Duration.seconds(10),
-});
-
-
-    processImageFn.addEventSource(newImageEventSource);
-
-    // Permissions
-
-    imagesBucket.grantRead(processImageFn);
-
-    // Output
-        imagesTable.grantReadWriteData(processImageFn);
-
-    newImageTopic.addSubscription(new subs.SqsSubscription(mailerQ));
-              rejectedImageFn.addEventSource(rejectedImageEventSource);
-
-
-    // Output
-    
     new cdk.CfnOutput(this, "bucketName", {
       value: imagesBucket.bucketName,
     });
